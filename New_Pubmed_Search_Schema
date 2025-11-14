@@ -1,0 +1,1 @@
+(Influenza A[Title/Abstract]) AND (protein*[Title/Abstract]) AND (mutation*[Title/Abstract] OR mutant*[Title/Abstract] OR variant*[Title/Abstract] OR substitution*[Title/Abstract] OR polymorphism*[Title/Abstract]) AND (Review[Publication Type] OR systematic review[Publication Type] OR meta-analysis[Publication Type])
