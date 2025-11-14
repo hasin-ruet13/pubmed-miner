@@ -1,4 +1,3 @@
-# Enhanced app.py - Add to your existing code
 from __future__ import annotations
 
 import os, json, io, zipfile
@@ -15,7 +14,7 @@ from services.pubmed import (
 )
 from pipeline.batch_analyze import fetch_all_fulltexts, analyze_texts
 from pipeline.csv_export import flatten_to_rows
-
+from services.natural_to_pubmed_query_converter import natural_query_to_pubmed_query
 # Import prompts for editing
 from llm.prompts import PROMPTS
 from llm.validation_questions import VALIDATION_QUESTIONS
@@ -224,7 +223,7 @@ def main():
             custom_headers_json = st.text_area(
                 "Extra HTTP headers (JSON)",
                 value=custom_headers_json,
-                help="Optional: JSON object of additional headers. Example: {\"X-Org\": \"Team-42\"}"
+                help='Optional: JSON object of additional headers. Example: {"X-Org": "Team-42"}'
             )
             parsed_headers: Dict[str, str] = {}
             if custom_headers_json.strip():
@@ -291,6 +290,18 @@ def main():
         st.divider()
         st.caption("💡 Tip: Test with 1-2 papers first to verify API keys work")
 
+    # Build LLM metadata for query converter (simplified version)
+    llm_meta_query = {
+        "model_choice": model_choice,
+        "model_name": model_name,
+        "api_key": api_key,
+    }
+    if "Custom" in model_choice:
+        llm_meta_query["api_url"] = custom_api_url
+        llm_meta_query["timeout"] = custom_timeout
+        if custom_headers_dict:
+            llm_meta_query["extra_headers"] = custom_headers_dict
+
     # ===== Prompt Editor Section =====
     with st.expander("📝 **Edit Extraction Prompt**", expanded=False):
         st.markdown("""
@@ -333,29 +344,6 @@ def main():
         - Output rules (prevents breaking changes)
         - Few-shot examples (maintains consistency)
         - The `{TEXT}` placeholder (required for paper content)
-        
-        ---
-        
-        ### Tips
-        
-        - **Add all mutation notation styles** you encounter (`A226V`, `p.Ala226Val`, spelled mutations, arrow notation like `226A→V`)
-        - **Include concrete examples** in pattern descriptions (e.g., "Arrow notation: 226A→V, 128K→E")
-        - **Test incrementally** with small changes to see the impact
-        - **Use "🔄 Reset to Default"** if something goes wrong
-        - Changes take effect immediately for the next extraction
-        
-        ---
-        
-        ### Example
-        
-        To add arrow notation (`226A→V`), update the mutation patterns in the **PATTERN RECOGNITION GUIDE** section:
-        
-        ```
-        **Mutation Patterns:**
-        • Standard: A226V, K128E
-        • Arrow notation: 226A→V, 128K→E  ← Add this line
-        • HGVS: p.Ala226Val
-        ```
         """)
         
         # Load current editable section
@@ -454,11 +442,20 @@ def main():
                 st.rerun()
 
     # ===== Search Section =====
-    st.subheader("1) Enter your PubMed query")
+    st.subheader("1) Enter your query")
     
     # Show NCBI API status in main area
     if not os.getenv("NCBI_API_KEY"):
         st.info("💡 **Tip:** Add your NCBI API key in the sidebar (👈) to increase rate limits from 3 to 10 requests/second.")
+    
+    # Query type selection
+    query_type = st.radio(
+        "Query Type",
+        ["Natural Language Query", "PubMed Query"],
+        index=0,
+        horizontal=True,
+        help="Choose 'Natural Language Query' to enter plain English, or 'PubMed Query' to enter a PubMed Boolean query directly."
+    )
     
     # Toggle for review papers only
     reviews_only = st.checkbox(
@@ -467,13 +464,21 @@ def main():
         help="If checked, only search for Review articles. If unchecked, search all article types."
     )
     
-    if reviews_only:
-        st.write("Paste a PubMed query (will restrict to **Review** articles automatically).")
+    # Set placeholder based on query type
+    if query_type == "Natural Language Query":
+        placeholder = 'e.g., dengue virus mutations in the E protein'
+        help_text = "Enter your search in plain English. The system will automatically convert it to a PubMed Boolean query. Examples: 'COVID-19 spike protein variants', 'influenza hemagglutinin mutations', 'dengue virus E protein structure'"
     else:
-        st.write("Paste a PubMed query (will search **all article types**).")
-    
-    query = st.text_area("Query", height=100, placeholder='e.g., dengue[MeSH Terms] AND mutation[Text Word]')
+        placeholder = 'e.g., (dengue[MeSH Terms] OR dengue virus[Title]) AND (mutation[Text Word] OR variant[Text Word])'
+        help_text = "Enter a PubMed Boolean query with field tags. Use AND, OR, NOT operators. Field tags: [Title], [MeSH Terms], [Text Word], [Abstract], etc."
 
+    query = st.text_area(
+        "Query", 
+        height=100, 
+        placeholder=placeholder,
+        help=help_text
+    )
+    
     st.subheader("2) Choose publication date range & search")
     colA, colB, colC, colD = st.columns([1, 1, 1, 1])
     with colA:
@@ -497,7 +502,10 @@ def main():
 
     search_button_text = "🔎 Search PubMed (reviews)" if reviews_only else "🔎 Search PubMed (all articles)"
     go = st.button(search_button_text)
+
+    # ===== Handle Search Button Click =====
     if go:
+        # Basic query check
         if not query.strip():
             st.warning("Please enter a query.")
         else:
@@ -526,22 +534,153 @@ def main():
                 st.error(f"❌ Invalid date format: {e}. Please use MM/YYYY (e.g., 01/2020)")
                 st.stop()
             
+            raw_query = query.strip()
+
+            # ---- NATURAL LANGUAGE BRANCH: convert but DO NOT search yet ----
+            if query_type == "Natural Language Query":
+                with st.spinner("🔄 Converting natural-language query to PubMed Boolean query…"):
+                    try:
+                        converted_query = natural_query_to_pubmed_query(raw_query, llm_meta_query)
+                    except Exception as e:
+                        st.warning(f"⚠️ Query conversion failed — using raw query. Error: {e}")
+                        converted_query = raw_query
+
+                # Store everything needed for later search
+                st.session_state["pending_nlq"] = True
+                st.session_state["nlq_payload"] = {
+                    "converted_query": converted_query,
+                    "mindate_formatted": mindate_formatted,
+                    "maxdate_formatted": maxdate_formatted,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "reviews_only": reviews_only,
+                    "sort": sort,
+                    "cap": cap,
+                }
+
+                st.info("✅ Converted query generated. You can edit it below and run the PubMed search.")
+
+            # ---- PUBMED QUERY BRANCH: run search immediately ----
+            else:
+                try:
+                    search_type = "reviews" if reviews_only else "all articles"
+                    with st.spinner(f"Searching PubMed ({search_type})…"):
+                        if reviews_only:
+                            pmids = esearch_reviews(raw_query, mindate=mindate_formatted, maxdate=maxdate_formatted, sort=sort, cap=cap)
+                        else:
+                            pmids = esearch_all(raw_query, mindate=mindate_formatted, maxdate=maxdate_formatted, sort=sort, cap=cap)
+                        
+                        if not pmids:
+                            st.warning(
+                                f"❌ **No results found for your query.**\n\n"
+                                f"**Your query:** `{raw_query}`\n\n"
+                                f"**Tips:**\n"
+                                f"- Try broader search terms\n"
+                                f"- Check spelling\n"
+                                f"- Expand date range (currently {start_date} to {end_date})\n"
+                                f"- Try a simpler query (e.g., just 'dengue mutation')"
+                            )
+                            for k in ["hits_df", "hits_pmids", "selected_pmids"]:
+                                if k in st.session_state:
+                                    del st.session_state[k]
+                        else:
+                            st.info(f"✅ Found {len(pmids)} PMIDs from NCBI. Fetching metadata...")
+                            sums = esummary(pmids)
+                            
+                            rows = []
+                            for pid in pmids:
+                                meta = sums.get(pid, {})
+                                pubdate_raw = meta.get("pubdate") or ""
+                                if overlaps(parse_pubdate_interval(pubdate_raw), (start_date, end_date)):
+                                    rows.append({
+                                        "PMID": str(pid),
+                                        "Title": meta.get("title") or "",
+                                        "Journal": meta.get("source") or "",
+                                        "PubDate": pubdate_raw,
+                                        "PubMed Link": f"https://pubmed.ncbi.nlm.nih.gov/{pid}/",
+                                    })
+                            
+                            df_hits = pd.DataFrame(rows)
+                            if df_hits.empty:
+                                for k in ["hits_df", "hits_pmids", "selected_pmids"]:
+                                    if k in st.session_state:
+                                        del st.session_state[k]
+                                st.warning(
+                                    f"⚠️ **Found {len(pmids)} results, but none match your date range.**\n\n"
+                                    f"Date range: {start_date} to {end_date}\n\n"
+                                    f"Try expanding the date range above."
+                                )
+                            else:
+                                df_hits["PMID"] = df_hits["PMID"].astype(str)
+                                _persist("hits_df", df_hits.to_dict("records"))
+                                _persist("hits_pmids", df_hits["PMID"].tolist())
+                                st.session_state["selected_pmids"] = []
+                                st.success(f"✅ Found {len(df_hits)} results. See 'Results' below to select papers.")
+                
+                except Exception as e:
+                    st.error(
+                        f"❌ **Error searching PubMed:**\n\n"
+                        f"```\n{str(e)}\n```\n\n"
+                        f"**Troubleshooting:**\n"
+                        f"1. Check your internet connection\n"
+                        f"2. Verify NCBI API key in `.env` file\n"
+                        f"3. Try again in a few seconds (rate limiting)\n"
+                        f"4. Simplify your query"
+                    )
+
+    # ===== NATURAL LANGUAGE CONFIRMATION / EDIT & SEARCH =====
+    if st.session_state.get("pending_nlq"):
+        payload = st.session_state.get("nlq_payload") or {}
+        converted_query = payload.get("converted_query", "")
+
+        st.write("### 📘 Converted PubMed Query (editable)")
+        edited_query = st.text_area(
+            "Converted PubMed Query (you can edit before running search):",
+            value=converted_query,
+            height=120,
+            key="nlq_query_edit"
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            run_nlq_search = st.button("✔ Use this query and search PubMed", key="btn_run_nlq")
+        with col2:
+            cancel_nlq = st.button("❌ Cancel", key="btn_cancel_nlq")
+
+        if cancel_nlq:
+            st.session_state["pending_nlq"] = False
+            st.session_state["nlq_payload"] = None
+            st.info("Natural-language query conversion cancelled.")
+
+        elif run_nlq_search:
+            # Unpack stored parameters
+            raw_query = edited_query
+            mindate_formatted = payload["mindate_formatted"]
+            maxdate_formatted = payload["maxdate_formatted"]
+            start_date = payload["start_date"]
+            end_date = payload["end_date"]
+            reviews_only = payload["reviews_only"]
+            sort = payload["sort"]
+            cap = payload["cap"]
+
             try:
                 search_type = "reviews" if reviews_only else "all articles"
                 with st.spinner(f"Searching PubMed ({search_type})…"):
                     if reviews_only:
-                        pmids = esearch_reviews(query.strip(), mindate=mindate_formatted, maxdate=maxdate_formatted, sort=sort, cap=cap)
+                        pmids = esearch_reviews(raw_query, mindate=mindate_formatted, maxdate=maxdate_formatted, sort=sort, cap=cap)
                     else:
-                        pmids = esearch_all(query.strip(), mindate=mindate_formatted, maxdate=maxdate_formatted, sort=sort, cap=cap)
+                        pmids = esearch_all(raw_query, mindate=mindate_formatted, maxdate=maxdate_formatted, sort=sort, cap=cap)
                     
                     if not pmids:
-                        st.warning(f"❌ **No results found for your query.**\n\n"
-                                  f"**Your query:** `{query.strip()}`\n\n"
-                                  f"**Tips:**\n"
-                                  f"- Try broader search terms\n"
-                                  f"- Check spelling\n"
-                                  f"- Expand date range (currently {start_date} to {end_date})\n"
-                                  f"- Try a simpler query (e.g., just 'dengue mutation')")
+                        st.warning(
+                            f"❌ **No results found for your query.**\n\n"
+                            f"**Your query:** `{raw_query}`\n\n"
+                            f"**Tips:**\n"
+                            f"- Try broader search terms\n"
+                            f"- Check spelling\n"
+                            f"- Expand date range (currently {start_date} to {end_date})\n"
+                            f"- Try a simpler query (e.g., just 'dengue mutation')"
+                        )
                         for k in ["hits_df", "hits_pmids", "selected_pmids"]:
                             if k in st.session_state:
                                 del st.session_state[k]
@@ -567,24 +706,31 @@ def main():
                             for k in ["hits_df", "hits_pmids", "selected_pmids"]:
                                 if k in st.session_state:
                                     del st.session_state[k]
-                            st.warning(f"⚠️ **Found {len(pmids)} results, but none match your date range.**\n\n"
-                                      f"Date range: {start_date} to {end_date}\n\n"
-                                      f"Try expanding the date range above.")
+                            st.warning(
+                                f"⚠️ **Found {len(pmids)} results, but none match your date range.**\n\n"
+                                f"Date range: {start_date} to {end_date}\n\n"
+                                f"Try expanding the date range above."
+                            )
                         else:
                             df_hits["PMID"] = df_hits["PMID"].astype(str)
                             _persist("hits_df", df_hits.to_dict("records"))
                             _persist("hits_pmids", df_hits["PMID"].tolist())
                             st.session_state["selected_pmids"] = []
                             st.success(f"✅ Found {len(df_hits)} results. See 'Results' below to select papers.")
-            
             except Exception as e:
-                st.error(f"❌ **Error searching PubMed:**\n\n"
-                        f"```\n{str(e)}\n```\n\n"
-                        f"**Troubleshooting:**\n"
-                        f"1. Check your internet connection\n"
-                        f"2. Verify NCBI API key in `.env` file\n"
-                        f"3. Try again in a few seconds (rate limiting)\n"
-                        f"4. Simplify your query")
+                st.error(
+                    f"❌ **Error searching PubMed:**\n\n"
+                    f"```\n{str(e)}\n```\n\n"
+                    f"**Troubleshooting:**\n"
+                    f"1. Check your internet connection\n"
+                    f"2. Verify NCBI API key in `.env` file\n"
+                    f"3. Try again in a few seconds (rate limiting)\n"
+                    f"4. Simplify your query"
+                )
+            finally:
+                # Clear pending NLQ state so we don't keep showing the editor
+                st.session_state["pending_nlq"] = False
+                st.session_state["nlq_payload"] = None
 
     # ===== Results display (unchanged) =====
     if st.session_state.get("hits_df"):
@@ -629,14 +775,22 @@ def main():
     st.subheader("3) Run extraction")
     colA, colB, colC = st.columns([1, 1, 1])
     with colA:
-        override_all = st.checkbox("Process ALL results (ignore selection)", value=False, 
-                                   help="When checked, all results from Step 2 will be sent to the LLM.")
+        override_all = st.checkbox(
+            "Process ALL results (ignore selection)", 
+            value=False, 
+            help="When checked, all results from Step 2 will be sent to the LLM."
+        )
     with colB:
-        clear_previous = st.checkbox("Clear previous results before run", value=True, 
-                                     help="Prevents older findings from appearing alongside this run.")
+        clear_previous = st.checkbox(
+            "Clear previous results before run", 
+            value=True, 
+            help="Prevents older findings from appearing alongside this run."
+        )
     with colC:
-        run_all = st.button("🚀 Fetch PMC & Run LLM", 
-                           disabled=(not override_all and len(st.session_state.get("selected_pmids", [])) == 0))
+        run_all = st.button(
+            "🚀 Fetch PMC & Run LLM", 
+            disabled=(not override_all and len(st.session_state.get("selected_pmids", [])) == 0)
+        )
 
     if st.button("🗑️ Reset", key="reset_all_data"):
         for k in ["hits_df", "hits_pmids", "batch_papers", "batch_results", "llm_log", 
@@ -659,8 +813,8 @@ def main():
             st.session_state["llm_log"] = []
         
         # Validate API key (strip whitespace first)
-        api_key = api_key.strip() if api_key else ""
-        if not api_key and "Custom" not in model_choice:
+        api_key_local = api_key.strip() if api_key else ""
+        if not api_key_local and "Custom" not in model_choice:
             st.error(f"⚠️ Please enter your {model_choice} API key in the sidebar!")
             st.stop()
         if "Custom" in model_choice and not custom_api_url:
@@ -679,16 +833,25 @@ def main():
         
         if n_ok:
             with st.expander("Show fetched list", expanded=False):
-                st.dataframe(pd.DataFrame(fetched), width='stretch', 
-                           height=min(400, 40 + 28 * len(fetched)))
+                st.dataframe(
+                    pd.DataFrame(fetched), 
+                    width='stretch', 
+                    height=min(400, 40 + 28 * len(fetched))
+                )
         if n_no:
             with st.expander("Show no-PMC list", expanded=False):
-                st.dataframe(pd.DataFrame(no_pmc), width='stretch', 
-                           height=min(400, 40 + 28 * len(no_pmc)))
+                st.dataframe(
+                    pd.DataFrame(no_pmc), 
+                    width='stretch', 
+                    height=min(400, 40 + 28 * len(no_pmc))
+                )
         if n_err:
             with st.expander("Show fetch errors", expanded=False):
-                st.dataframe(pd.DataFrame(errors), width='stretch', 
-                           height=min(400, 40 + 28 * len(errors)))
+                st.dataframe(
+                    pd.DataFrame(errors), 
+                    width='stretch', 
+                    height=min(400, 40 + 28 * len(errors))
+                )
         
         if n_ok == 0:
             st.stop()
@@ -750,7 +913,7 @@ def main():
             mime="application/zip"
         )
 
-        # ===== LLM extraction phase (MODIFIED) =====
+        # ===== LLM extraction phase =====
         papers = st.session_state.get("batch_papers", {})
         ok_pmids_this_run = [pid for pid, info in papers.items() if info.get("status") == "ok"]
         
@@ -772,7 +935,7 @@ def main():
         llm_meta = {
             "model_choice": model_choice,
             "model_name": model_name,
-            "api_key": api_key,  # This will be used as PRIMARY in backend
+            "api_key": api_key_local,  # This will be used as PRIMARY in backend
             "analyst_prompt": PROMPTS.analyst_prompt,  # Current prompt (includes user edits)
         }
         
@@ -804,7 +967,7 @@ def main():
                     delay_ms=delay_ms, 
                     min_confidence=min_conf, 
                     require_mut_quote=True,
-                    llm_meta=llm_meta,  # NEW: pass model config
+                    llm_meta=llm_meta,  # pass model config
                     enable_validation=enable_validation,
                     validation_accuracy_threshold=validation_threshold,
                     validation_delay_ms=validation_delay_ms,
