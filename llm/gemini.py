@@ -6,8 +6,14 @@ from __future__ import annotations
 import os
 import time
 import threading
+import warnings
 from time import monotonic as _mono
 from typing import List, Dict, Any, Optional
+
+# Suppress harmless Google gRPC ALTS credential warnings
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+os.environ.setdefault("GLOG_minloglevel", "2")
+warnings.filterwarnings("ignore", category=UserWarning, module="google")
 
 # Import ALL shared utilities
 from llm import utils

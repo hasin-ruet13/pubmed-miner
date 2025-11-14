@@ -18,6 +18,7 @@ from pipeline.csv_export import flatten_to_rows
 
 # Import prompts for editing
 from llm.prompts import PROMPTS
+from llm.validation_questions import VALIDATION_QUESTIONS
 
 
 def _persist(key, value):
@@ -262,6 +263,32 @@ def main():
         min_conf = st.slider("Min confidence", 0.0, 1.0, 0.6, 0.05)
         
         st.divider()
+        
+        # Validation settings
+        st.header("✅ Validation Settings")
+        enable_validation = st.checkbox(
+            "Enable Agentic Validation",
+            value=False,
+            help="Validate all extractions by asking multiple questions per extraction. Uses the same LLM backend."
+        )
+        
+        if enable_validation:
+            validation_threshold = st.slider(
+                "Validation Accuracy Threshold (%)",
+                50, 100, 85, 5,
+                help="Minimum accuracy percentage to pass validation (default: 85%)"
+            )
+            validation_delay_ms = st.slider(
+                "Validation Delay (ms)",
+                0, 1000, 200, 50,
+                help="Delay between validation calls to avoid rate limits"
+            )
+            st.info("ℹ️ Validation will ask 2-3 questions per extraction and check if accuracy ≥ threshold.")
+        else:
+            validation_threshold = 85.0
+            validation_delay_ms = 200
+        
+        st.divider()
         st.caption("💡 Tip: Test with 1-2 papers first to verify API keys work")
 
     # ===== Prompt Editor Section =====
@@ -344,7 +371,7 @@ def main():
         
         col1, col2, col3 = st.columns([1, 1, 3])
         with col1:
-            if st.button("💾 Save Changes"):
+            if st.button("💾 Save Changes", key="save_prompt_changes"):
                 PROMPTS.analyst_prompt_editable = edited_section
                 # Clear any override to use the new editable section
                 PROMPTS._analyst_prompt_override = ""
@@ -352,7 +379,7 @@ def main():
                 st.rerun()
         
         with col2:
-            if st.button("🔄 Reset to Default"):
+            if st.button("🔄 Reset to Default", key="reset_prompt_default"):
                 from llm.prompts import AnalystPrompts
                 default_prompts = AnalystPrompts()
                 PROMPTS.analyst_prompt_editable_part1 = default_prompts.analyst_prompt_editable_part1
@@ -367,6 +394,64 @@ def main():
             full_preview = PROMPTS.analyst_prompt
             st.code(full_preview, language="text", line_numbers=False)
             st.caption("💡 This is what the LLM receives. The editable section is embedded in the middle.")
+
+    # ===== Validation Question Editor Section =====
+    with st.expander("✅ **Edit Validation Questions**", expanded=False):
+        st.markdown("""
+        ### Customize Validation Questions
+        
+        Enter 1-5 validation questions (one per line). These questions will be asked for each extraction.
+        
+        **Placeholders you can use:**
+        - `{mutation}` - The mutation name (e.g., "A226V")
+        - `{feature_name}` - The feature name (e.g., "RNA-binding domain")
+        - `{protein}` - The protein name (e.g., "E1", "nsP3")
+        - `{virus}` - The virus name (e.g., "Chikungunya virus")
+        - `{position}` - Single position (e.g., "226")
+        - `{residue_range}` - Residue range (e.g., "1-73")
+        - `{effect_description}` - Effect/function description
+        
+        **Example:**
+        ```
+        Is there experimental evidence for a sequence feature in {protein} protein of {virus}?
+        Are the residue positions correctly identified for this feature in {protein}?
+        Is the biological function correctly described for this feature in {protein}?
+        ```
+        """)
+        
+        # Get current questions as a single string (one per line)
+        current_questions = "\n".join(VALIDATION_QUESTIONS.questions)
+        
+        questions_text = st.text_area(
+            "Validation Questions (1-5 questions, one per line)",
+            value=current_questions,
+            height=200,
+            help="Enter 1-5 questions, one per line. Each question will be asked for every extraction.",
+            key="val_questions_text"
+        )
+        
+        # Count questions
+        question_lines = [q.strip() for q in questions_text.split('\n') if q.strip()]
+        num_questions = len(question_lines)
+        
+        if num_questions == 0:
+            st.warning("⚠️ Please provide at least 1 question.")
+        elif num_questions > 5:
+            st.warning(f"⚠️ You have {num_questions} questions. Only the first 5 will be used.")
+        else:
+            st.info(f"✅ {num_questions} question(s) configured.")
+        
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            if st.button("💾 Save Questions", key="save_val_questions"):
+                VALIDATION_QUESTIONS.questions = questions_text
+                st.success("✅ Validation questions updated!")
+        
+        with col2:
+            if st.button("🔄 Reset to Default", key="reset_val_questions"):
+                VALIDATION_QUESTIONS.reset_to_default()
+                st.success("✅ Reset to default validation questions.")
+                st.rerun()
 
     # ===== Search Section =====
     st.subheader("1) Enter your PubMed query")
@@ -553,7 +638,7 @@ def main():
         run_all = st.button("🚀 Fetch PMC & Run LLM", 
                            disabled=(not override_all and len(st.session_state.get("selected_pmids", [])) == 0))
 
-    if st.button("🗑️ Reset"):
+    if st.button("🗑️ Reset", key="reset_all_data"):
         for k in ["hits_df", "hits_pmids", "batch_papers", "batch_results", "llm_log", 
                   "selected_pmids", "select_all_hits", "pmid_multiselect"]:
             if k in st.session_state:
@@ -720,9 +805,24 @@ def main():
                     min_confidence=min_conf, 
                     require_mut_quote=True,
                     llm_meta=llm_meta,  # NEW: pass model config
+                    enable_validation=enable_validation,
+                    validation_accuracy_threshold=validation_threshold,
+                    validation_delay_ms=validation_delay_ms,
                 )
                 batch_results.update(single_dict)
                 _persist("batch_results", batch_results)
+                
+                # Show validation status if enabled
+                if enable_validation and pmid in single_dict:
+                    val_result = single_dict[pmid].get("validation")
+                    if val_result and "error" not in val_result:
+                        accuracy = val_result.get("overall_accuracy", 0.0)
+                        passed = val_result.get("meets_threshold", False)
+                        status_icon = "✅" if passed else "⚠️"
+                        log_line_val = f"   ↳ Validation: {status_icon} Accuracy: {accuracy:.1f}% (threshold: {validation_threshold}%)"
+                        llm_log.append(log_line_val)
+                        _persist("llm_log", llm_log)
+                        log_box.code("\n".join(llm_log[-20:]), language="text")
                 
                 out_df_partial = flatten_to_rows(batch_results)
                 table_box.dataframe(out_df_partial, width='stretch')
@@ -735,6 +835,113 @@ def main():
             prog.progress(int(i * 100 / total), text=f"LLM progress: {i}/{total}")
         
         st.success("LLM extraction complete ✅")
+        
+        # Show validation summary if enabled
+        if enable_validation:
+            batch_results = st.session_state.get("batch_results", {})
+            validation_summary = []
+            for pmid, entry in batch_results.items():
+                if entry.get("status") == "ok" and "validation" in entry:
+                    val = entry.get("validation", {})
+                    if "error" not in val:
+                        validation_summary.append({
+                            "PMID": pmid,
+                            "Title": entry.get("title", "")[:80],
+                            "Accuracy": f"{val.get('overall_accuracy', 0.0):.1f}%",
+                            "Status": "✅ Pass" if val.get("meets_threshold") else "⚠️ Fail",
+                            "Extractions": val.get("total_extractions", 0),
+                            "Validations": f"{val.get('passed_validations', 0)}/{val.get('total_validations', 0)}"
+                        })
+            
+            if validation_summary:
+                st.markdown("#### Validation Summary")
+                val_df = pd.DataFrame(validation_summary)
+                st.dataframe(val_df, width='stretch')
+                
+                # Show detailed validation results with questions
+                st.markdown("#### Detailed Validation Results")
+                for pmid, entry in batch_results.items():
+                    if entry.get("status") == "ok" and "validation" in entry:
+                        val = entry.get("validation", {})
+                        if "error" not in val and "extraction_validations" in val:
+                            with st.expander(f"📄 {pmid} - {entry.get('title', '')[:60]}... (Accuracy: {val.get('overall_accuracy', 0.0):.1f}%)", expanded=False):
+                                extraction_validations = val.get("extraction_validations", [])
+                                st.write(f"**Total Extractions:** {len(extraction_validations)}")
+                                st.write(f"**Overall Accuracy:** {val.get('overall_accuracy', 0.0):.1f}%")
+                                st.write(f"**Status:** {'✅ Passed' if val.get('meets_threshold') else '⚠️ Failed'} (threshold: {validation_threshold}%)")
+                                st.divider()
+                                
+                                for idx, ext_val in enumerate(extraction_validations, 1):
+                                    extraction = ext_val.get("extraction", {})
+                                    validation = ext_val.get("validation", {})
+                                    questions = validation.get("questions", [])
+                                    answers = validation.get("answers", [])
+                                    scores = validation.get("scores", {})
+                                    extraction_info = validation.get("extraction_info", {})
+                                    
+                                    # Show extraction summary with row info
+                                    mutation = ext_val.get("mutation") or extraction.get("mutation", "") or extraction_info.get("mutation", "")
+                                    protein = ext_val.get("protein") or extraction.get("protein", "") or extraction_info.get("protein", "")
+                                    virus = ext_val.get("virus") or extraction.get("virus", "") or extraction_info.get("virus", "")
+                                    position = ext_val.get("position") or extraction.get("position") or extraction_info.get("position")
+                                    
+                                    ext_title = f"**Extraction {idx} (Row {ext_val.get('extraction_index', idx)}):** "
+                                    if mutation:
+                                        ext_title += f"Mutation {mutation}"
+                                    elif protein:
+                                        ext_title += f"Feature in {protein}"
+                                    else:
+                                        ext_title += "Feature"
+                                    
+                                    if position:
+                                        ext_title += f" @ position {position}"
+                                    
+                                    if virus:
+                                        ext_title += f" ({virus})"
+                                    
+                                    st.markdown(ext_title)
+                                    
+                                    # Show row info in a compact format
+                                    row_info_parts = []
+                                    if mutation:
+                                        row_info_parts.append(f"Mutation: {mutation}")
+                                    if protein:
+                                        row_info_parts.append(f"Protein: {protein}")
+                                    if position:
+                                        row_info_parts.append(f"Position: {position}")
+                                    if row_info_parts:
+                                        st.caption(" | ".join(row_info_parts))
+                                    
+                                    # Show questions and answers
+                                    if questions and answers:
+                                        st.markdown("**Questions Asked:**")
+                                        for q_idx, question in enumerate(questions, 1):
+                                            # Find corresponding answer (question number is 1-indexed)
+                                            answer_obj = next(
+                                                (a for a in answers if isinstance(a, dict) and a.get("question") == q_idx),
+                                                {"answer": "UNCERTAIN", "rationale": "No answer found"}
+                                            )
+                                            answer = answer_obj.get("answer", "UNCERTAIN")
+                                            rationale = answer_obj.get("rationale", "")
+                                            
+                                            # Color code based on answer
+                                            if answer.upper() == "YES":
+                                                status_icon = "✅"
+                                            elif answer.upper() == "NO":
+                                                status_icon = "❌"
+                                            else:
+                                                status_icon = "⚠️"
+                                            
+                                            st.markdown(f"{status_icon} **Q{q_idx}:** {question}")
+                                            st.markdown(f"   **Answer:** {answer}")
+                                            if rationale:
+                                                st.markdown(f"   **Rationale:** {rationale}")
+                                        
+                                        # Show extraction accuracy
+                                        ext_accuracy = scores.get("accuracy", 0.0)
+                                        st.markdown(f"**Extraction Accuracy:** {ext_accuracy:.1f}% ({scores.get('passed', 0)}/{scores.get('total', 0)} questions passed)")
+                                    
+                                    st.markdown("---")
         
         out_df = flatten_to_rows(st.session_state.get("batch_results", {}))
         table_box.dataframe(out_df, width='stretch')

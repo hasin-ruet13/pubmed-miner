@@ -11,6 +11,14 @@ from llm.unified import run_on_paper, clean_and_ground
 from services.pmc import get_pmc_fulltext_with_meta, get_last_fetch_source
 from pipeline.csv_export import flatten_to_rows
 
+# Optional validation import
+try:
+    from llm.validation import validate_all_extractions
+    VALIDATION_AVAILABLE = True
+except ImportError:
+    VALIDATION_AVAILABLE = False
+    validate_all_extractions = None
+
 
 def _is_truthy(value) -> bool:
     if isinstance(value, bool):
@@ -91,7 +99,10 @@ def analyze_texts(papers: dict,
                   min_confidence: float = 0.6,
                   require_mut_quote: bool = True,
                   llm_meta: dict | None = None,
-                  paper_pause_sec: float | None = None) -> Dict[str, Dict]:
+                  paper_pause_sec: float | None = None,
+                  enable_validation: bool = False,
+                  validation_accuracy_threshold: float = 85.0,
+                  validation_delay_ms: int = 200) -> Dict[str, Dict]:
     """
     Run LLM extraction on each 'ok' paper, then clean+ground.
     Returns dict[pmid] = { status, pmcid, title, result? }
@@ -157,6 +168,32 @@ def analyze_texts(papers: dict,
         
         if capture_raw:
             results[pmid]["raw_llm"] = raw
+        
+        # Run validation if enabled
+        if enable_validation and VALIDATION_AVAILABLE and validate_all_extractions:
+            try:
+                extractions = cleaned.get("sequence_features", [])
+                if extractions:
+                    validation_meta = meta.copy()  # Use same LLM settings
+                    validation_result = validate_all_extractions(
+                        extractions=extractions,
+                        full_text=text,
+                        meta=validation_meta,
+                        accuracy_threshold=validation_accuracy_threshold,
+                        delay_ms=validation_delay_ms,
+                    )
+                    results[pmid]["validation"] = validation_result
+                    # Add validation flag to result
+                    results[pmid]["validation_passed"] = validation_result.get("meets_threshold", False)
+                    results[pmid]["validation_accuracy"] = validation_result.get("overall_accuracy", 0.0)
+            except Exception as e:
+                # Don't fail the whole extraction if validation fails
+                results[pmid]["validation"] = {
+                    "error": str(e),
+                    "status": "failed"
+                }
+                results[pmid]["validation_passed"] = False
+                results[pmid]["validation_accuracy"] = 0.0
 
         # Gentle pacing between papers
         if paper_pause_sec and paper_pause_sec > 0:
